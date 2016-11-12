@@ -1,0 +1,315 @@
+/* Weather station transmitter
+   2016_07_23 First build
+   2016_08_06 Include pressure sensor BMP 180
+   2016_08_13 Include components to send the data via Xbee to coordinator
+   2016_08_13  clean up the transmission
+   2016_08_28  change time to 60 seconds interval
+   2016_09_17 Add rain gauge
+   2016_09_30 Add windvane "N"
+   2016_10_10 "O" add gust measurements
+*/
+
+#include "DHT.h" //DHT 22 library
+#include <SFE_BMP180.h>  /barometric pressure sensor library
+#include "binary.h" //this needs to be in the directory, no error when missing?
+#include <Wire.h>
+#include <XBee.h>
+#include <Printers.h>
+#include <AltSoftSerial.h> //eventually try to live without it
+#include <avr/pgmspace.h>
+
+DHT dht(4, DHT22);  //DHT-22 temperature and humidity sensor on Digital PIN 4
+SFE_BMP180 pressure; //define pressure object
+
+#define ALTITUDE 139.0 //Germantown in meters
+#define VANE_PIN A0  //windvane pin
+
+float dhtH, dhtT;  //humidity / temperature from DHT-22
+double bmpT, bmpP, p0; // from BMP-180
+float beaconTime; // timer set on millis(). Apparently, cant be done in int or long
+float sendInterval = 30000;  //interval to measure and send the data.  eventually plant to send this via XBee Beacon
+float gustTime;  //start time for the gust counter
+float  gustInterval = 5000;  //interval between gusts.  
+const int vaneValues[] PROGMEM = {66, 84, 92, 127, 184, 244, 287, 406, 461, 600, 631, 702, 786, 827, 889, 946}; // the values derived from the winvane
+const int vaneDirections[] PROGMEM = {1125, 675, 900, 1575, 1350, 2025, 1800, 225, 450, 2475, 2250, 3375, 0, 2925, 3150, 2700}; //windirections in degrees *10
+unsigned int vaneReading = 0;
+int windDirection;
+int n, i, allDiff, diff, allN; //counters
+
+XBeeWithCallbacks xbee;  //xbee object
+
+AltSoftSerial SoftSerial;
+#define DebugSerial Serial
+#define XBeeSerial SoftSerial
+
+//Wind Speed
+int AnemInterruptPin = 2; // Uno has only 2 interrupts, the other is rain
+volatile unsigned int AnemCount = 0; // interrupt counts of Anemometer
+volatile unsigned int GustCount = 0; 
+volatile unsigned int MinGustCount;  
+volatile unsigned int MaxGustCount;
+volatile unsigned long anem_last = 0;
+volatile unsigned long anem_min = 0xffffffff;
+long WindSpeed,  MaxGust, MinGust; // max/min values of windspeed within gustInterval
+#define WindFactor 2.4 // conversion from interrupt / seconds to km/h.  hope this is correct, have not calibrated
+
+int RainInterruptPin = 3; 
+volatile unsigned int RainCount = 0;
+volatile unsigned long Rain_last = 0;
+float RainRate = 0;
+volatile unsigned long Rain_min = 0xffffffff;
+long RainFall;
+#define RainFactor 0.2794 // conversion from interrupt / rain / mm.  
+
+//**************
+
+void setup() {
+
+  // Setup debug serial output
+  DebugSerial.begin(115200); 
+  DebugSerial.println(F("Starting..."));
+  beaconTime = millis();
+  gustTime = millis();
+
+  dht.begin();  //start DHT22
+
+  if (pressure.begin())
+    DebugSerial.println(F("BMP180 init success"));
+  else
+  {
+    // Oops, something went wrong, this is usually a connection problem,
+
+    DebugSerial.println(F("BMP180 init fail\n\n"));
+    while (1); // Pause forever.
+  }
+
+  // Setup XBee serial communication
+  XBeeSerial.begin(9600);
+  xbee.begin(XBeeSerial);
+  delay(1);
+
+  // Setup callbacks
+  xbee.onPacketError(printErrorCb, (uintptr_t)(Print*)&DebugSerial);
+  xbee.onResponse(printErrorCb, (uintptr_t)(Print*)&DebugSerial);
+  // Send a first packet right away
+  sendPacket();
+
+  //Wind Speed
+  pinMode(AnemInterruptPin, INPUT);
+  digitalWrite(AnemInterruptPin, HIGH); //pullup
+  attachInterrupt(0, AnemAcq, RISING); // interrupt for windspeed only
+  
+  // Rain 
+  pinMode(RainInterruptPin, INPUT);
+  digitalWrite(RainInterruptPin, HIGH); //pullup
+  attachInterrupt(1, RainAcq  , CHANGE); // interrupt for rain gauge
+// *****
+
+}
+
+
+void loop() {
+
+  if (millis() > (beaconTime + sendInterval))
+  { //for simplicity, running the beaconTimer for both sensor acquistion and sending.  
+    bmp180(); //call the BMP180 Pressure / Temperature sensor
+    dhtHumid(); //call DHT for data
+    windRose(); // call wind direction, stupid name
+    sendPacket(); // send the packet
+    beaconTime = millis();  //reset the timer
+  }
+}
+
+void dhtHumid() {
+  dhtH  = dht.readHumidity();
+  // Read temperature as Celsius (the default)
+  dhtT = dht.readTemperature(false);
+
+}
+
+void bmp180() {
+  char status;
+
+  // Start a temperature measurement:
+  // If request is successful, the number of ms to wait is returned.
+  // If request is unsuccessful, 0 is returned.
+  // this entire block doesnt make sense.  keeping it in there for now
+
+  status = pressure.startTemperature();
+  if (status != 0)
+  {
+    // Wait for the measurement to complete:
+    delay(status);
+
+    // Function returns 1 if successful, 0 if failure.
+
+    status = pressure.getTemperature(bmpT);
+    if (status != 0)
+    {
+      // Print out the measurement:
+
+      // Start a pressure measurement:
+      // The parameter is the oversampling setting, from 0 to 3 (highest res, longest wait).
+      // If request is successful, the number of ms to wait is returned.
+      // If request is unsuccessful, 0 is returned.
+
+      status = pressure.startPressure(3);
+      if (status != 0)
+      {
+        // Wait for the measurement to complete:
+        delay(status);
+
+        // Retrieve the completed pressure measurement:
+        status = pressure.getPressure(bmpP, bmpT);
+        if (status != 0)
+        {
+          // The pressure sensor returns abolute pressure, which varies with altitude.
+          // To remove the effects of altitude, use the sealevel function and your current altitude.
+          p0 = pressure.sealevel(bmpP, ALTITUDE); // altitude was set level of house 
+        }
+        else Serial.println("error retrieving pressure measurement\n");
+      }
+      else Serial.println("error starting pressure measurement\n");
+    }
+    else Serial.println("error retrieving temperature measurement\n");
+  }
+  else Serial.println("error starting temperature measurement\n");
+}
+
+void sendPacket() {
+
+  detachInterrupt(AnemInterruptPin); //stop interrupts while sending package //this is probably overkill but I dont like taking chances with interrupts during transmissison
+  detachInterrupt(RainInterruptPin); //stop interrupts while sending package
+  
+  WindSpeed = (AnemCount / sendInterval * 1000) * WindFactor;
+  MaxGust = (MaxGustCount / gustInterval * 1000) * WindFactor;
+  MinGust = (MinGustCount / gustInterval * 1000) * WindFactor;
+
+  if (MinGustCount == 0 || MinGustCount == 1000) {  //messy code.  Cant reset the MinGust to 0 since it will always be lower than any reading.  Setting it to some large value 
+    MinGust = 0;  
+   }
+  
+  MaxGustCount = 0;
+  MinGustCount = 1000; //messy way of doing it
+  
+  RainRate = (RainCount * RainFactor); // accummulated raind during the interval. The true mm/[time] is done elsewhere
+  AnemCount = 0;
+  RainCount = 0;
+
+
+  // Prepare the Zigbee Transmit Request API packet
+  ZBTxRequest txRequest;
+  txRequest.setAddress64(0x0000000000000000);  //I assume this is broadcast.
+
+  // Allocate 40 payload bytes.  10 parameters = 8x4 bytes + 1 byte.
+  // Appending this needs appending on the Coordinator as well - shouldnt one be able to use the length?
+
+  AllocBuffer<41> packet;
+
+  // Packet type, temperature, humidity
+  packet.append<uint8_t>(1);  //this is the additional byte.
+  packet.append<float>(dhtT);  //each parameter has 4 bytes
+  packet.append<float>(dhtH);
+  packet.append<float>(bmpT);
+  packet.append<float>(p0);
+  packet.append<float>(WindSpeed);
+  packet.append<float>(RainRate);
+  packet.append<float>(windDirection);
+  packet.append<float>(MaxGust);
+  packet.append<float>(MinGust);
+  packet.append<float>(millis());  //place holder for battery status or the like.  not relevant
+
+  txRequest.setPayload(packet.head, packet.len());
+
+  // And send it
+  xbee.send(txRequest);
+  attachInterrupt(0, AnemAcq, RISING);
+  attachInterrupt(1, RainAcq, CHANGE);
+
+  //local debug log for troubleshooting.  
+  DebugSerial.println(millis());
+  DebugSerial.print("DHT Temp   ");
+  DebugSerial.println(dhtT);
+  DebugSerial.print("DHT Humid  ");
+  DebugSerial.println(dhtH);
+  DebugSerial.print("BMP Temp   ");
+  DebugSerial.println(bmpT);
+  DebugSerial.print("BMP Pressure   ");
+  DebugSerial.println(p0);
+  DebugSerial.print("Wind Speed   ");
+  DebugSerial.println(WindSpeed);
+  DebugSerial.print("Rain Rate   ");
+  DebugSerial.println(RainRate);
+  DebugSerial.print("wind direction   ");
+  DebugSerial.println(windDirection);
+  DebugSerial.print("MaxGust   ");
+  DebugSerial.println(MaxGust);  
+  DebugSerial.print("MinGust   ");
+  DebugSerial.println(MinGust);  
+  DebugSerial.println("-----------------");
+}
+
+void AnemAcq()
+{
+  long thisTime = micros() - anem_last;
+  anem_last = micros();
+
+  if (thisTime > 500)
+  {
+    AnemCount++;
+    GustCount ++;
+    if (thisTime < anem_min)
+    {
+      anem_min = thisTime;
+    }
+    if (millis() > (gustTime + gustInterval)) {
+      if (GustCount > MaxGustCount) {
+        MaxGustCount = GustCount;
+      }
+      if (GustCount <= MinGustCount) {
+        MinGustCount = GustCount;
+      }
+      
+      gustTime = millis();
+      GustCount = 0;
+      
+    }
+    
+  }
+}
+
+void RainAcq()
+{
+  long thisTimeRain = micros() - Rain_last;
+  Rain_last = micros();
+
+  if (thisTimeRain > 100)
+  {
+    RainCount++;
+    if (thisTimeRain < Rain_min)
+    {
+      Rain_min = thisTimeRain;
+    }
+  }
+}
+
+void windRose()
+{
+  vaneReading = analogRead(VANE_PIN); //read the analog signal from the Windvane, optional: float voltage= vaneReading * (5.0 / 1023.0);
+
+  for (n = 0; n < 16; n++) //16 possible positions of the windvane
+  {
+    diff = vaneReading - pgm_read_word(&vaneValues[n]); // calculate the difference between the actual reading and the ideal valuye from the array
+    diff = abs(diff);
+
+    if (diff < allDiff) { //select the vaneValue with the smallest difference to the ideal. The vaneReading is a little noisy, this seems to take care of it
+      allDiff = diff; //allDiff = smallest difference from the array compoarison.  Kind on bubblesort.  dont really need this value, for debugging
+      allN = n; //allN is the position in the array with the smallest different between ideal and measured
+    }
+  }
+
+  windDirection = (pgm_read_word(&vaneDirections[allN]) / 10); //report winddirection
+  
+  diff = 1000;  //set diff to something high so that the routine doesnt get stuck
+  allDiff = 1000;
+}
