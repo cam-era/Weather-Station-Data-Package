@@ -1,0 +1,139 @@
+/*Connects to the weatherstation receiver
+   A 2016 10 29 Combine the incoming I2C data and send to Thingspeak
+   B 2016 11 03 Added rain rate to export
+*/
+
+
+#include <SoftwareSerial.h> // Include software serial library, ESP8266 library dependency
+#include <SparkFunESP8266WiFi.h> // Include the ESP8266 AT library
+#include "ThingSpeak.h"
+#include <Wire.h>; 
+#include <I2C_Anything.h>
+const char mySSID[] = "mySSID";
+const char myPSK[] = "myPassword";
+char thingSpeakAddress[] = "api.thingspeak.com";
+String APIKey = "myChannelID";              
+ESP8266Client client;
+
+
+
+const byte MY_ADDRESS = 42;
+volatile float dhtH;
+volatile float dhtT;
+volatile float bmpT;
+volatile float p0 ;
+volatile int WindSpeed ;
+volatile float RainRate;
+volatile int windDirection ;
+volatile int MaxGust;
+volatile int MinGust;
+volatile float indoorTemp;
+int Gust;
+
+void setup()
+{
+  Wire.begin (MY_ADDRESS);
+  Serial.begin (115200);
+  Wire.onReceive (receiveEvent);
+  WifiStart();  //starts the ESP8266 and connects to Magnolia
+
+}  // end of setup
+
+volatile boolean haveData = false;
+
+
+
+void loop()
+{
+
+  if (haveData)
+  {
+
+/*    Serial.println (dhtH);
+    Serial.println (dhtT);
+    Serial.println (bmpT);
+    Serial.println (p0);
+    Serial.println (WindSpeed);
+    Serial.println (RainRate);
+    Serial.println (windDirection);
+    Serial.println (MaxGust);
+    Serial.println (MinGust);
+    Serial.println (indoorTemp);
+    Serial.println ("----------------");
+*/
+    haveData = false;
+  
+  updateThingSpeak("field1=" + String (dhtT) + "&field2=" + String(dhtH) + "&field3=" + String(WindSpeed) + "&field4=" + String(windDirection));
+  updateThingSpeak("field5=" + String (p0) + "&field6=" + String (RainRate) + "&field7=" + String(Gust) + "&field8=" + String(indoorTemp));
+  
+  
+  }  // end if haveData
+
+}  // end of loop
+
+
+// called by interrupt service routine when incoming data arrives
+void receiveEvent (int howMany)
+{
+  //if (howMany >= (sizeof fnum) + (sizeof foo))
+  if (howMany >= 1)
+  {
+    I2C_readAnything (dhtH);
+    I2C_readAnything (dhtT);
+    I2C_readAnything (bmpT);
+    I2C_readAnything (p0);
+    I2C_readAnything (WindSpeed);
+    I2C_readAnything (RainRate);
+    I2C_readAnything (windDirection);
+    I2C_readAnything (MaxGust);
+    I2C_readAnything (MinGust);
+    I2C_readAnything (indoorTemp);
+    Gust = MaxGust - MinGust;
+
+    haveData = true;
+  }  // end if have enough data
+}  // end of receiveEvent
+
+void WifiStart()
+{
+if (esp8266.begin()) // Initialize the ESP8266 and check it's return status
+    Serial.println("ESP8266 ready to go!"); // Communication and setup successful
+else
+    Serial.println("Unable to communicate with the ESP8266 :(");
+
+int retVal;
+ retVal = esp8266.connect(mySSID, myPSK);
+if (retVal < 0)
+{
+    Serial.print(F("Error connecting: "));
+    Serial.println(retVal);
+}
+
+IPAddress myIP = esp8266.localIP(); // Get the ESP8266's local IP
+Serial.print(F("My IP is: ")); Serial.println(myIP);
+
+
+}
+
+void updateThingSpeak(String tsData) {
+  if (client.connect(thingSpeakAddress, 80)) {
+    client.print("POST /update HTTP/1.1\n");
+    client.print("Host: api.thingspeak.com\n");
+    client.print("Connection: close\n");
+    client.print("X-THINGSPEAKAPIKEY: " + APIKey + "\n");
+    client.print("Content-Type: application/x-www-form-urlencoded\n");
+    client.print("Content-Length: ");
+    client.print(tsData.length());
+    client.print("\n\n");
+    client.print(tsData);
+    Serial.print(millis());
+    Serial.print("   ");
+    Serial.println(tsData);
+    
+    
+    if (client.connected()) {
+      Serial.println("Connecting to ThingSpeak...");
+      Serial.println();
+    }
+  }
+}
